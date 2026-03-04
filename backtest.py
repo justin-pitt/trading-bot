@@ -1,10 +1,10 @@
 """
-Backtester
-Run and evaluate the trend-following strategy on historical data.
+Backtester — Riley Coleman Price Action Strategy
+Bar-by-bar simulation on 1m data using 15m S/R zones.
 
 Usage:
     python backtest.py
-    python backtest.py --symbol NQ --fast 15 --slow 50
+    python backtest.py --symbol NQ --capital 50000 --min-rr 2.5
 """
 
 import argparse
@@ -12,7 +12,7 @@ import pandas as pd
 import numpy as np
 import logging
 from data_feed import DataFeed
-from strategy import TrendFollowingStrategy
+from strategy import PriceActionStrategy
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger('Backtest')
@@ -20,80 +20,90 @@ logger = logging.getLogger('Backtest')
 
 def run_backtest(
     symbol: str = 'ES',
-    fast_period: int = 20,
-    slow_period: int = 55,
-    atr_period: int = 14,
-    atr_stop_multiplier: float = 2.0,
-    risk_per_trade: float = 0.01,
+    period: str = '60d',
     starting_capital: float = 100_000,
-    period: str = '5y'
+    min_rr: float = 2.0,
 ) -> dict:
     feed = DataFeed()
-    strategy = TrendFollowingStrategy(fast_period, slow_period, atr_period, atr_stop_multiplier, risk_per_trade)
+    strategy = PriceActionStrategy(min_risk_reward=min_rr)
+    tick_value = strategy.TICK_VALUES.get(symbol.upper(), 10.0)
 
-    logger.info(f"Fetching {period} of data for {symbol}...")
-    df = feed.get_historical(symbol, period=period, interval='1d')
+    logger.info(f"Fetching 15m data ({period}) and 1m data (5d) for {symbol}...")
+    df_15m = feed.get_intraday(symbol, interval='15m', period=period)
+    df_1m  = feed.get_intraday(symbol, interval='1m',  period='5d')
 
-    if df is None or df.empty:
-        logger.error(f"No data for {symbol}")
+    if df_15m is None or df_15m.empty:
+        logger.error(f"No 15m data for {symbol}")
+        return {}
+    if df_1m is None or df_1m.empty:
+        logger.error(f"No 1m data for {symbol}")
         return {}
 
-    df = strategy.calculate_indicators(df)
-    df = df.dropna()
+    logger.info(f"Simulating {len(df_1m)} 1m bars...")
 
-    # ── Simulate trades ───────────────────────────────────────────────────────
     capital = starting_capital
-    position = 0       # 1 = long, -1 = short, 0 = flat
-    entry_price = 0.0
-    stop_price = 0.0
-    quantity = 1
-
-    tick_value = strategy.TICK_VALUES.get(symbol, 10.0)
+    position = None   # dict with: action, entry, stop, target, qty, setup_type
     trades = []
     equity_curve = [capital]
 
-    for i in range(1, len(df)):
-        row = df.iloc[i]
-        prev = df.iloc[i - 1]
+    for i in range(20, len(df_1m)):
+        df_1m_so_far = df_1m.iloc[:i + 1]
+        bar = df_1m.iloc[i]
 
-        # Check stop loss
-        if position == 1 and row['low'] <= stop_price:
-            pnl = (stop_price - entry_price) * quantity * tick_value
-            capital += pnl
-            trades.append({'type': 'LONG', 'entry': entry_price, 'exit': stop_price, 'pnl': pnl, 'exit_reason': 'STOP'})
-            position = 0
+        # Check open position exit first
+        if position is not None:
+            if position['action'] == 'BUY':
+                stop_hit   = bar['low']  <= position['stop']
+                target_hit = bar['high'] >= position['target']
+            else:
+                stop_hit   = bar['high'] >= position['stop']
+                target_hit = bar['low']  <= position['target']
 
-        elif position == -1 and row['high'] >= stop_price:
-            pnl = (entry_price - stop_price) * quantity * tick_value
-            capital += pnl
-            trades.append({'type': 'SHORT', 'entry': entry_price, 'exit': stop_price, 'pnl': pnl, 'exit_reason': 'STOP'})
-            position = 0
+            if stop_hit or target_hit:
+                # If both hit same bar, conservatively assume stop
+                if stop_hit and target_hit:
+                    exit_price  = position['stop']
+                    exit_reason = 'STOP'
+                elif target_hit:
+                    exit_price  = position['target']
+                    exit_reason = 'TARGET'
+                else:
+                    exit_price  = position['stop']
+                    exit_reason = 'STOP'
 
-        # Check crossover signals
-        bullish_cross = row['ema_fast'] > row['ema_slow'] and prev['ema_fast'] <= prev['ema_slow']
-        bearish_cross = row['ema_fast'] < row['ema_slow'] and prev['ema_fast'] >= prev['ema_slow']
+                qty = position['qty']
+                if position['action'] == 'BUY':
+                    pnl = (exit_price - position['entry']) * qty * tick_value
+                else:
+                    pnl = (position['entry'] - exit_price) * qty * tick_value
 
-        if bullish_cross:
-            if position == -1:  # Close short
-                pnl = (entry_price - row['close']) * quantity * tick_value
                 capital += pnl
-                trades.append({'type': 'SHORT', 'entry': entry_price, 'exit': row['close'], 'pnl': pnl, 'exit_reason': 'SIGNAL'})
+                trades.append({
+                    'setup_type': position['setup_type'],
+                    'action':     position['action'],
+                    'entry':      position['entry'],
+                    'exit':       exit_price,
+                    'stop':       position['stop'],
+                    'target':     position['target'],
+                    'pnl':        pnl,
+                    'exit_reason': exit_reason,
+                })
+                position = None
+                equity_curve.append(capital)
+                continue
 
-            quantity = strategy.calculate_position_size(capital, row['atr'], symbol)
-            entry_price = row['close']
-            stop_price = row['close'] - (row['atr'] * atr_stop_multiplier)
-            position = 1
-
-        elif bearish_cross:
-            if position == 1:  # Close long
-                pnl = (row['close'] - entry_price) * quantity * tick_value
-                capital += pnl
-                trades.append({'type': 'LONG', 'entry': entry_price, 'exit': row['close'], 'pnl': pnl, 'exit_reason': 'SIGNAL'})
-
-            quantity = strategy.calculate_position_size(capital, row['atr'], symbol)
-            entry_price = row['close']
-            stop_price = row['close'] + (row['atr'] * atr_stop_multiplier)
-            position = -1
+        # No open position — check for signal
+        if position is None:
+            sig = strategy.get_signal(df_15m, df_1m_so_far, symbol, capital)
+            if sig.action in ('BUY', 'SELL'):
+                position = {
+                    'action':     sig.action,
+                    'entry':      sig.entry_price,
+                    'stop':       sig.stop_price,
+                    'target':     sig.target_price,
+                    'qty':        sig.suggested_quantity,
+                    'setup_type': sig.setup_type,
+                }
 
         equity_curve.append(capital)
 
@@ -103,44 +113,48 @@ def run_backtest(
         return {}
 
     trade_df = pd.DataFrame(trades)
-    wins = trade_df[trade_df['pnl'] > 0]
+    wins   = trade_df[trade_df['pnl'] > 0]
     losses = trade_df[trade_df['pnl'] <= 0]
 
-    total_return = (capital - starting_capital) / starting_capital
-    win_rate = len(wins) / len(trade_df) if len(trade_df) > 0 else 0
-    profit_factor = wins['pnl'].sum() / abs(losses['pnl'].sum()) if len(losses) > 0 else float('inf')
+    total_return  = (capital - starting_capital) / starting_capital
+    win_rate      = len(wins) / len(trade_df)
+    profit_factor = wins['pnl'].sum() / abs(losses['pnl'].sum()) if len(losses) > 0 and losses['pnl'].sum() != 0 else float('inf')
+
+    pnl_series = trade_df['pnl']
+    sharpe = (pnl_series.mean() / pnl_series.std() * np.sqrt(252 * 390)) if pnl_series.std() > 0 else 0
 
     equity = pd.Series(equity_curve)
-    returns = equity.pct_change().dropna()
-    sharpe = (returns.mean() / returns.std() * np.sqrt(252)) if returns.std() > 0 else 0
-
-    rolling_max = equity.cummax()
-    drawdown = (equity - rolling_max) / rolling_max
+    rolling_max  = equity.cummax()
+    drawdown     = (equity - rolling_max) / rolling_max
     max_drawdown = drawdown.min()
 
+    # Breakdown by setup type
+    setup_stats = {}
+    for setup in ('RETEST', 'FAILED_BREAKOUT', '7AM_REVERSAL'):
+        subset = trade_df[trade_df['setup_type'] == setup]
+        if len(subset) > 0:
+            setup_wins = subset[subset['pnl'] > 0]
+            setup_stats[setup] = {
+                'count':    len(subset),
+                'win_rate': len(setup_wins) / len(subset),
+            }
+
     results = {
-        'symbol': symbol,
-        'params': {
-            'fast_period': fast_period,
-            'slow_period': slow_period,
-            'atr_period': atr_period,
-            'atr_stop_multiplier': atr_stop_multiplier,
-            'risk_per_trade': risk_per_trade
-        },
-        'total_trades': len(trade_df),
-        'win_rate': round(win_rate, 4),
+        'symbol':        symbol,
+        'total_trades':  len(trade_df),
+        'win_rate':      round(win_rate, 4),
         'profit_factor': round(profit_factor, 2),
-        'total_return': round(total_return, 4),
-        'sharpe': round(sharpe, 2),
-        'max_drawdown': round(max_drawdown, 4),
-        'final_capital': round(capital, 2)
+        'total_return':  round(total_return, 4),
+        'sharpe':        round(sharpe, 2),
+        'max_drawdown':  round(max_drawdown, 4),
+        'final_capital': round(capital, 2),
+        'setup_stats':   setup_stats,
     }
 
     # Print summary
-    logger.info("\n" + "=" * 50)
-    logger.info(f"  BACKTEST RESULTS — {symbol}")
-    logger.info("=" * 50)
-    logger.info(f"  Period:         {period}")
+    logger.info("\n" + "=" * 55)
+    logger.info(f"  BACKTEST RESULTS — {symbol}  (Riley Coleman PA)")
+    logger.info("=" * 55)
     logger.info(f"  Total Trades:   {results['total_trades']}")
     logger.info(f"  Win Rate:       {results['win_rate']:.1%}")
     logger.info(f"  Profit Factor:  {results['profit_factor']:.2f}")
@@ -148,30 +162,26 @@ def run_backtest(
     logger.info(f"  Sharpe Ratio:   {results['sharpe']:.2f}")
     logger.info(f"  Max Drawdown:   {results['max_drawdown']:.1%}")
     logger.info(f"  Final Capital:  ${results['final_capital']:,.2f}")
-    logger.info("=" * 50)
+    if setup_stats:
+        logger.info("  --- By Setup ---")
+        for setup, stats in setup_stats.items():
+            logger.info(f"  {setup:<20} count={stats['count']}  win={stats['win_rate']:.1%}")
+    logger.info("=" * 55)
 
     return results
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Backtest the trend-following strategy')
-    parser.add_argument('--symbol', default='ES', help='Futures symbol (ES, NQ, CL, etc.)')
-    parser.add_argument('--fast', type=int, default=20, help='Fast EMA period')
-    parser.add_argument('--slow', type=int, default=55, help='Slow EMA period')
-    parser.add_argument('--atr', type=int, default=14, help='ATR period')
-    parser.add_argument('--stop-mult', type=float, default=2.0, help='ATR stop multiplier')
-    parser.add_argument('--risk', type=float, default=0.01, help='Risk per trade (0.01 = 1%%)')
+    parser = argparse.ArgumentParser(description='Backtest the Riley Coleman price action strategy')
+    parser.add_argument('--symbol',  default='ES',      help='Futures symbol (ES, NQ, CL, etc.)')
+    parser.add_argument('--period',  default='60d',     help='15m data lookback period (e.g. 60d)')
     parser.add_argument('--capital', type=float, default=100_000, help='Starting capital')
-    parser.add_argument('--period', default='5y', help='Data period (1y, 2y, 5y)')
+    parser.add_argument('--min-rr',  type=float, default=2.0,     help='Minimum risk:reward ratio')
     args = parser.parse_args()
 
     run_backtest(
         symbol=args.symbol,
-        fast_period=args.fast,
-        slow_period=args.slow,
-        atr_period=args.atr,
-        atr_stop_multiplier=args.stop_mult,
-        risk_per_trade=args.risk,
+        period=args.period,
         starting_capital=args.capital,
-        period=args.period
+        min_rr=args.min_rr,
     )

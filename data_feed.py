@@ -85,6 +85,52 @@ class DataFeed:
             logger.error(f"Error fetching data for {symbol}: {e}")
             return None
 
+    def get_intraday(
+        self,
+        symbol: str,
+        interval: str = '15m',
+        period: str = '60d'
+    ) -> Optional[pd.DataFrame]:
+        """
+        Fetch intraday bar data from Yahoo Finance.
+
+        Parameters
+        ----------
+        symbol   : Futures symbol (e.g. 'ES', 'NQ', 'CL')
+        interval : Bar interval ('1m', '5m', '15m', '60m')
+        period   : Lookback period — yfinance limits 1m to 7 days max, use '5d'
+
+        Returns
+        -------
+        DataFrame with lowercase columns: open, high, low, close, volume
+        """
+        try:
+            import yfinance as yf
+        except ImportError:
+            raise ImportError("yfinance not installed. Run: pip install yfinance")
+
+        ticker = FUTURES_SYMBOLS.get(symbol.upper(), symbol)
+
+        try:
+            df = yf.download(ticker, period=period, interval=interval, progress=False)
+
+            if df.empty:
+                logger.warning(f"No intraday data returned for {symbol} ({ticker}, {interval})")
+                return None
+
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = [col[0].lower() for col in df.columns]
+            else:
+                df.columns = [c.lower() for c in df.columns]
+
+            df.dropna(inplace=True)
+            logger.info(f"Fetched {len(df)} intraday bars for {symbol} ({interval}, {period})")
+            return df
+
+        except Exception as e:
+            logger.error(f"Error fetching intraday data for {symbol}: {e}")
+            return None
+
     def get_live_bars_from_file(self, filepath: str) -> Optional[pd.DataFrame]:
         """
         Read live bar data written by a NinjaTrader indicator to a CSV file.

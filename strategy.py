@@ -1,17 +1,15 @@
 """
-Trend-Following Strategy with ATR-Based Position Sizing
-Based on the Turtle Trading / CTA dual moving average crossover framework.
-
-Most proven futures strategy:
-- Dual EMA crossover (20/55 period — Turtle system defaults)
-- ATR-based stop placement (2x ATR)
-- Risk-per-trade position sizing (1% account risk)
+Riley Coleman Price Action Strategy
+Multi-timeframe S/R zones, retest reversals, and failed breakout reversals.
+No indicators — pure price action on 15m (structure) and 1m (entry).
 """
 
+import datetime
 import pandas as pd
 import numpy as np
 import logging
 from dataclasses import dataclass
+from datetime import time
 
 logger = logging.getLogger(__name__)
 
@@ -20,174 +18,247 @@ logger = logging.getLogger(__name__)
 class TradeSignal:
     action: str           # 'BUY', 'SELL', 'HOLD'
     symbol: str
+    setup_type: str       # 'RETEST', 'FAILED_BREAKOUT', '7AM_REVERSAL', 'NONE'
+    entry_price: float
     stop_price: float
+    target_price: float
+    risk_reward: float
+    level: float
     atr: float
-    ema_fast: float
-    ema_slow: float
-    suggested_quantity: int = 0
+    suggested_quantity: int = 1
     reason: str = ''
 
 
-class TrendFollowingStrategy:
+class PriceActionStrategy:
     """
-    Dual EMA crossover with ATR stops and risk-based position sizing.
-
-    Parameters
-    ----------
-    fast_period : int
-        Fast EMA period (default 20)
-    slow_period : int
-        Slow EMA period (default 55 — Turtle system)
-    atr_period : int
-        ATR lookback period (default 14)
-    atr_stop_multiplier : float
-        Stop distance = ATR * multiplier (default 2.0)
-    risk_per_trade : float
-        Fraction of account to risk per trade (default 0.01 = 1%)
+    Riley Coleman-style price action strategy.
+    Detects S/R zones on 15m chart, confirms entries on 1m chart.
+    Three setups: Retest Reversal, Failed Breakout, 7 AM Reversal.
     """
 
     TICK_VALUES = {
-        'ES': 12.50,    # S&P 500 E-mini  ($12.50/tick, 0.25 tick size)
-        'NQ': 5.00,     # Nasdaq E-mini   ($5.00/tick,  0.25 tick size)
-        'CL': 10.00,    # Crude Oil       ($10.00/tick, 0.01 tick size)
-        'GC': 10.00,    # Gold            ($10.00/tick, 0.10 tick size)
-        'ZB': 31.25,    # 30yr T-Bond     ($31.25/tick)
-        'RTY': 5.00,    # Russell 2000    ($5.00/tick)
-        'YM': 5.00,     # Dow E-mini      ($5.00/tick)
+        'ES':  12.50,
+        'NQ':   5.00,
+        'CL':  10.00,
+        'GC':  10.00,
+        'ZB':  31.25,
+        'RTY':  5.00,
+        'YM':   5.00,
     }
 
     def __init__(
         self,
-        fast_period: int = 20,
-        slow_period: int = 55,
+        sr_lookback: int = 50,
+        sr_touch_min: int = 2,
+        sr_zone_buffer: float = 0.3,
+        min_risk_reward: float = 2.0,
+        retest_tolerance: float = 0.5,
+        rejection_wick_min: float = 1.5,
+        open_window_start: datetime.time = time(9, 30),
+        open_window_end: datetime.time = time(10, 0),
+        risk_per_trade: float = 0.01,
         atr_period: int = 14,
-        atr_stop_multiplier: float = 2.0,
-        risk_per_trade: float = 0.01
     ):
-        self.fast_period = fast_period
-        self.slow_period = slow_period
-        self.atr_period = atr_period
-        self.atr_stop_multiplier = atr_stop_multiplier
+        self.sr_lookback = sr_lookback
+        self.sr_touch_min = sr_touch_min
+        self.sr_zone_buffer = sr_zone_buffer
+        self.min_risk_reward = min_risk_reward
+        self.retest_tolerance = retest_tolerance
+        self.rejection_wick_min = rejection_wick_min
+        self.open_window_start = open_window_start
+        self.open_window_end = open_window_end
         self.risk_per_trade = risk_per_trade
+        self.atr_period = atr_period
 
-    # ── Indicator Calculation ────────────────────────────────────────────────
-
-    def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Add all required indicators to the DataFrame.
-        Input df must have lowercase columns: open, high, low, close, volume
-        """
-        df = df.copy()
-        df.columns = [c.lower() for c in df.columns]
-
-        # EMAs
-        df['ema_fast'] = df['close'].ewm(span=self.fast_period, adjust=False).mean()
-        df['ema_slow'] = df['close'].ewm(span=self.slow_period, adjust=False).mean()
-
-        # True Range & ATR
+    def _calc_atr(self, df: pd.DataFrame) -> pd.Series:
         prev_close = df['close'].shift(1)
-        df['tr'] = np.maximum(
+        tr = pd.concat([
             df['high'] - df['low'],
-            np.maximum(
-                (df['high'] - prev_close).abs(),
-                (df['low'] - prev_close).abs()
-            )
-        )
-        df['atr'] = df['tr'].rolling(window=self.atr_period).mean()
+            (df['high'] - prev_close).abs(),
+            (df['low'] - prev_close).abs(),
+        ], axis=1).max(axis=1)
+        return tr.rolling(self.atr_period).mean()
 
-        # Raw signal: 1 = bullish, -1 = bearish
-        df['signal'] = np.where(df['ema_fast'] > df['ema_slow'], 1, -1)
+    def find_sr_levels(self, df_15m: pd.DataFrame) -> list:
+        df = df_15m.iloc[-self.sr_lookback:].copy()
+        atr_val = self._calc_atr(df).iloc[-1]
+        zone = atr_val * self.sr_zone_buffer
 
-        # Crossover: change in signal direction
-        df['crossover'] = df['signal'].diff()
+        candidates = []
+        for i in range(2, len(df) - 2):
+            row = df.iloc[i]
+            # Swing high: greater than 2 bars on each side
+            if (row['high'] > df.iloc[i - 1]['high'] and
+                    row['high'] > df.iloc[i - 2]['high'] and
+                    row['high'] > df.iloc[i + 1]['high'] and
+                    row['high'] > df.iloc[i + 2]['high']):
+                candidates.append(row['high'])
+            # Swing low: less than 2 bars on each side
+            if (row['low'] < df.iloc[i - 1]['low'] and
+                    row['low'] < df.iloc[i - 2]['low'] and
+                    row['low'] < df.iloc[i + 1]['low'] and
+                    row['low'] < df.iloc[i + 2]['low']):
+                candidates.append(row['low'])
 
-        # Stop distance
-        df['stop_distance'] = df['atr'] * self.atr_stop_multiplier
+        if not candidates:
+            return []
 
-        return df
+        candidates.sort()
+        clusters = []
+        current = [candidates[0]]
+        for price in candidates[1:]:
+            if price - current[0] <= zone * 2:
+                current.append(price)
+            else:
+                clusters.append(current)
+                current = [price]
+        clusters.append(current)
 
-    # ── Signal Generation ────────────────────────────────────────────────────
+        return [float(np.mean(c)) for c in clusters if len(c) >= self.sr_touch_min]
+
+    def _is_rejection_candle(self, row: pd.Series, direction: str) -> bool:
+        body = abs(row['close'] - row['open'])
+        total_range = row['high'] - row['low']
+        if total_range == 0:
+            return False
+        lower_wick = min(row['open'], row['close']) - row['low']
+        upper_wick = row['high'] - max(row['open'], row['close'])
+        if direction == 'bullish':
+            return (lower_wick >= body * self.rejection_wick_min and
+                    lower_wick >= total_range * 0.4)
+        if direction == 'bearish':
+            return (upper_wick >= body * self.rejection_wick_min and
+                    upper_wick >= total_range * 0.4)
+        return False
+
+    def _in_morning_window(self, df: pd.DataFrame) -> bool:
+        last_idx = df.index[-1]
+        if not hasattr(last_idx, 'time'):
+            return False
+        t = last_idx.time()
+        return self.open_window_start <= t <= self.open_window_end
+
+    def _position_size(self, account_value: float, atr: float, symbol: str) -> int:
+        dollar_risk = account_value * self.risk_per_trade
+        tick_value = self.TICK_VALUES.get(symbol.upper(), 10.0)
+        if atr <= 0:
+            return 1
+        contracts = dollar_risk / (atr * 1.5 * tick_value)
+        return max(1, int(contracts))
 
     def get_signal(
         self,
-        df: pd.DataFrame,
+        df_15m: pd.DataFrame,
+        df_1m: pd.DataFrame,
         symbol: str,
-        account_value: float = 100_000
+        account_value: float = 100_000,
     ) -> TradeSignal:
-        """
-        Evaluate the latest bar and return a TradeSignal.
-        Only fires on a fresh crossover, not on every bar.
-        """
-        df = self.calculate_indicators(df)
 
-        if len(df) < self.slow_period + 5:
-            return TradeSignal('HOLD', symbol, 0, 0, 0, 0, reason='Insufficient data')
+        def hold(reason=''):
+            return TradeSignal('HOLD', symbol, 'NONE', 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, reason=reason)
 
-        latest = df.iloc[-1]
-        prev = df.iloc[-2]
+        if len(df_15m) < self.sr_lookback or len(df_1m) < 20:
+            return hold('Insufficient data')
 
-        ema_f = latest['ema_fast']
-        ema_s = latest['ema_slow']
-        atr = latest['atr']
-        close = latest['close']
+        df_15m = df_15m.copy()
+        df_1m = df_1m.copy()
+        df_15m.columns = [c.lower() for c in df_15m.columns]
+        df_1m.columns = [c.lower() for c in df_1m.columns]
 
-        # Bullish crossover
-        if ema_f > ema_s and prev['ema_fast'] <= prev['ema_slow']:
-            stop = close - (atr * self.atr_stop_multiplier)
-            qty = self.calculate_position_size(account_value, atr, symbol)
-            return TradeSignal(
-                action='BUY',
-                symbol=symbol,
-                stop_price=round(stop, 2),
-                atr=round(atr, 4),
-                ema_fast=round(ema_f, 2),
-                ema_slow=round(ema_s, 2),
-                suggested_quantity=qty,
-                reason=f'EMA{self.fast_period} crossed above EMA{self.slow_period}'
+        atr = float(self._calc_atr(df_1m).iloc[-1])
+        levels = self.find_sr_levels(df_15m)
+        if not levels:
+            return hold('No S/R levels found')
+
+        latest = df_1m.iloc[-1]
+        prev = df_1m.iloc[-2]
+        close = float(latest['close'])
+        zone = atr * self.sr_zone_buffer
+        in_window = self._in_morning_window(df_1m)
+        qty = self._position_size(account_value, atr, symbol)
+        recent_15m = df_15m.iloc[-10:]
+
+        for level in levels:
+            price_at_level = abs(close - level) <= zone * (1 + self.retest_tolerance)
+
+            # Setup A — Retest Reversal BUY
+            recently_broke_above = any(
+                recent_15m.iloc[j]['close'] > level and recent_15m.iloc[j - 1]['close'] < level
+                for j in range(1, len(recent_15m))
             )
+            if recently_broke_above and price_at_level and self._is_rejection_candle(latest, 'bullish'):
+                stop = level - atr * 1.5
+                target = close + (close - stop) * self.min_risk_reward
+                rr = (target - close) / (close - stop) if (close - stop) != 0 else 0
+                if rr >= self.min_risk_reward:
+                    setup = '7AM_REVERSAL' if in_window else 'RETEST'
+                    return TradeSignal(
+                        action='BUY', symbol=symbol, setup_type=setup,
+                        entry_price=round(close, 2), stop_price=round(stop, 2),
+                        target_price=round(target, 2), risk_reward=round(rr, 2),
+                        level=round(level, 2), atr=round(atr, 4),
+                        suggested_quantity=qty,
+                        reason=f'{setup}: broke above {level:.2f}, retesting',
+                    )
 
-        # Bearish crossover
-        if ema_f < ema_s and prev['ema_fast'] >= prev['ema_slow']:
-            stop = close + (atr * self.atr_stop_multiplier)
-            qty = self.calculate_position_size(account_value, atr, symbol)
-            return TradeSignal(
-                action='SELL',
-                symbol=symbol,
-                stop_price=round(stop, 2),
-                atr=round(atr, 4),
-                ema_fast=round(ema_f, 2),
-                ema_slow=round(ema_s, 2),
-                suggested_quantity=qty,
-                reason=f'EMA{self.fast_period} crossed below EMA{self.slow_period}'
+            # Setup B — Retest Reversal SELL
+            recently_broke_below = any(
+                recent_15m.iloc[j]['close'] < level and recent_15m.iloc[j - 1]['close'] > level
+                for j in range(1, len(recent_15m))
             )
+            if recently_broke_below and price_at_level and self._is_rejection_candle(latest, 'bearish'):
+                stop = level + atr * 1.5
+                target = close - (stop - close) * self.min_risk_reward
+                rr = (close - target) / (stop - close) if (stop - close) != 0 else 0
+                if rr >= self.min_risk_reward:
+                    setup = '7AM_REVERSAL' if in_window else 'RETEST'
+                    return TradeSignal(
+                        action='SELL', symbol=symbol, setup_type=setup,
+                        entry_price=round(close, 2), stop_price=round(stop, 2),
+                        target_price=round(target, 2), risk_reward=round(rr, 2),
+                        level=round(level, 2), atr=round(atr, 4),
+                        suggested_quantity=qty,
+                        reason=f'{setup}: broke below {level:.2f}, retesting',
+                    )
 
-        return TradeSignal(
-            action='HOLD',
-            symbol=symbol,
-            stop_price=0,
-            atr=round(atr, 4),
-            ema_fast=round(ema_f, 2),
-            ema_slow=round(ema_s, 2),
-            reason='No crossover'
-        )
+            # Setup C — Failed Breakout BUY
+            fakeout_bull = (
+                float(prev['low']) < level - zone and
+                close > level and
+                float(latest['close']) > float(latest['open'])
+            )
+            if fakeout_bull:
+                stop = float(prev['low']) - atr * 0.5
+                target = close + (close - stop) * self.min_risk_reward
+                rr = (target - close) / (close - stop) if (close - stop) != 0 else 0
+                if rr >= self.min_risk_reward:
+                    return TradeSignal(
+                        action='BUY', symbol=symbol, setup_type='FAILED_BREAKOUT',
+                        entry_price=round(close, 2), stop_price=round(stop, 2),
+                        target_price=round(target, 2), risk_reward=round(rr, 2),
+                        level=round(level, 2), atr=round(atr, 4),
+                        suggested_quantity=qty,
+                        reason=f'FAILED_BREAKOUT: fakeout below {level:.2f}, closed back above',
+                    )
 
-    # ── Position Sizing ──────────────────────────────────────────────────────
+            # Setup D — Failed Breakout SELL
+            fakeout_bear = (
+                float(prev['high']) > level + zone and
+                close < level and
+                float(latest['close']) < float(latest['open'])
+            )
+            if fakeout_bear:
+                stop = float(prev['high']) + atr * 0.5
+                target = close - (stop - close) * self.min_risk_reward
+                rr = (close - target) / (stop - close) if (stop - close) != 0 else 0
+                if rr >= self.min_risk_reward:
+                    return TradeSignal(
+                        action='SELL', symbol=symbol, setup_type='FAILED_BREAKOUT',
+                        entry_price=round(close, 2), stop_price=round(stop, 2),
+                        target_price=round(target, 2), risk_reward=round(rr, 2),
+                        level=round(level, 2), atr=round(atr, 4),
+                        suggested_quantity=qty,
+                        reason=f'FAILED_BREAKOUT: fakeout above {level:.2f}, closed back below',
+                    )
 
-    def calculate_position_size(
-        self,
-        account_value: float,
-        atr: float,
-        symbol: str
-    ) -> int:
-        """
-        Risk-based N-unit sizing from the Turtle Trading system.
-        Contracts = (Account * Risk%) / (ATR * TickValue)
-        """
-        tick_value = self.TICK_VALUES.get(symbol.upper(), 10.0)
-        dollar_risk = account_value * self.risk_per_trade
-
-        if atr <= 0:
-            return 1
-
-        contracts = dollar_risk / (atr * tick_value)
-        return max(1, int(contracts))
+        return hold('No setup')

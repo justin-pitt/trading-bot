@@ -14,7 +14,7 @@ Environment variables (set in .env):
     ANTHROPIC_API_KEY Required only if USE_LANGCHAIN=true
     USE_LANGCHAIN     Enable LangChain AI layer (true/false, default false)
     SYMBOLS           Comma-separated futures symbols (default ES,NQ,CL)
-    SCAN_INTERVAL     Seconds between strategy scans (default 300)
+    SCAN_INTERVAL     Seconds between strategy scans (default 60 for intraday)
     LIVE_DATA_DIR     Path to directory where LiveBarExporter writes CSV files.
                       If set, live NT8 bar data is used instead of Yahoo Finance.
                       Example: C:\\NinjaTrader\\LiveBars
@@ -30,7 +30,7 @@ import sys
 from dotenv import load_dotenv
 
 from ninjatrader_bridge import NinjaTraderBridge
-from strategy import TrendFollowingStrategy
+from strategy import PriceActionStrategy
 from data_feed import DataFeed
 from risk_manager import RiskManager
 
@@ -54,7 +54,7 @@ class TradingBot:
         self.account       = os.getenv('NT_ACCOUNT', 'Sim101')
         self.account_value = float(os.getenv('ACCOUNT_VALUE', 100_000))
         self.symbols       = os.getenv('SYMBOLS', 'ES,NQ,CL').split(',')
-        self.scan_interval = int(os.getenv('SCAN_INTERVAL', 300))
+        self.scan_interval = int(os.getenv('SCAN_INTERVAL', 60))
         self.use_langchain = os.getenv('USE_LANGCHAIN', 'false').lower() == 'true'
 
         # Live data feed config (set LIVE_DATA_DIR to switch from Yahoo Finance to NT8 bars)
@@ -63,7 +63,7 @@ class TradingBot:
 
         # Core components
         self.bridge   = NinjaTraderBridge(self.host, self.port)
-        self.strategy = TrendFollowingStrategy()
+        self.strategy = PriceActionStrategy()
         self.feed     = DataFeed()
         self.risk     = RiskManager()
 
@@ -89,7 +89,8 @@ class TradingBot:
         logger.info(f"Symbols:   {self.symbols}")
         logger.info(f"Interval:  {self.scan_interval}s")
         logger.info(f"Data:      {'NT8 live files (' + self.live_data_dir + ')' if self.live_data_dir else 'Yahoo Finance (daily bars)'}")
-        logger.info(f"LangChain: {'enabled' if self.use_langchain else 'disabled'}")
+        logger.info(f"Strategy: Riley Coleman Price Action (Retest + Failed Breakout)")
+        logger.info(f"Claude AI layer: {'enabled' if self.use_langchain else 'disabled'}")
 
         if not self.bridge.connect():
             logger.error("Cannot start: NinjaTrader connection failed.")
@@ -165,19 +166,22 @@ class TradingBot:
         return df, 'yahoo'
 
     def _process_symbol(self, symbol: str):
-        # 1. Fetch data
-        df, source = self._get_bars(symbol)
-        if df is None or len(df) < 60:
-            logger.warning(f"{symbol}: insufficient data from {source}, skipping.")
+        # 1. Fetch both timeframes
+        df_15m = self.feed.get_intraday(symbol, interval='15m', period='60d')
+        df_1m  = self.feed.get_intraday(symbol, interval='1m',  period='5d')
+
+        if df_15m is None or len(df_15m) < 50:
+            logger.warning(f"{symbol}: insufficient 15m data, skipping.")
+            return
+        if df_1m is None or len(df_1m) < 20:
+            logger.warning(f"{symbol}: insufficient 1m data, skipping.")
             return
 
         # 2. Get strategy signal
-        signal = self.strategy.get_signal(df, symbol, self.account_value)
+        signal = self.strategy.get_signal(df_15m, df_1m, symbol, self.account_value)
         logger.info(
-            f"{symbol} [{source}]: action={signal.action} | "
-            f"EMA{self.strategy.fast_period}={signal.ema_fast} | "
-            f"EMA{self.strategy.slow_period}={signal.ema_slow} | "
-            f"ATR={signal.atr} | reason={signal.reason}"
+            f"{symbol}: action={signal.action} | setup={signal.setup_type} | "
+            f"level={signal.level} | R:R={signal.risk_reward} | reason={signal.reason}"
         )
 
         if signal.action == 'HOLD':
@@ -193,25 +197,24 @@ class TradingBot:
         quantity = signal.suggested_quantity
         if self.sentiment:
             decision = self.sentiment.should_trade(symbol, signal.action)
-            logger.info(f"{symbol}: LangChain decision={decision.decision} | {decision.reason}")
+            logger.info(f"{symbol}: Claude decision={decision.decision} | {decision.reason}")
             if decision.decision == 'SKIP':
-                logger.info(f"{symbol}: Trade skipped by LangChain.")
+                logger.info(f"{symbol}: Trade skipped by Claude.")
                 return
             if decision.decision == 'REDUCE':
                 quantity = max(1, int(quantity * decision.size_multiplier))
                 logger.info(f"{symbol}: Position size reduced to {quantity} contracts.")
 
-        # 5. Execute order
-        latest_close = float(df.iloc[-1]['close'])
-        self._execute_signal(symbol, signal.action, quantity, signal.stop_price, latest_close)
+        # 5. Execute
+        self._execute_signal(symbol, signal.action, quantity, signal.stop_price, signal.target_price)
 
-    def _execute_signal(self, symbol: str, action: str, quantity: int, stop_price: float, entry_price: float):
-        logger.info(f"EXECUTING: {action} {quantity}x {symbol} | entry~{entry_price} | stop={stop_price}")
+    def _execute_signal(self, symbol: str, action: str, quantity: int, stop_price: float, target_price: float):
+        logger.info(f"EXECUTING: {action} {quantity}x {symbol} | stop={stop_price} | target={target_price}")
 
-        # Place main order
+        # Place main market order
         self.bridge.place_market_order(self.account, action, quantity, symbol)
 
-        # Place protective stop
+        # Place protective stop loss
         stop_action = 'SELL' if action == 'BUY' else 'BUY'
         self.bridge.place_stop_order(
             account=self.account,
@@ -221,8 +224,18 @@ class TradingBot:
             stop_price=stop_price
         )
 
+        # Place profit target as a limit order
+        target_action = 'SELL' if action == 'BUY' else 'BUY'
+        self.bridge.place_limit_order(
+            account=self.account,
+            action=target_action,
+            quantity=quantity,
+            symbol=symbol,
+            limit_price=target_price
+        )
+
         # Update risk state
-        self.risk.record_open_position(symbol, action, quantity, entry_price)
+        self.risk.record_open_position(symbol, action, quantity, 0)
 
     def _log_status(self):
         status = self.risk.get_status()

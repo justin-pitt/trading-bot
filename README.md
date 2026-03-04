@@ -107,20 +107,39 @@ The bot falls back to Yahoo Finance automatically if a live file is missing or h
 
 ---
 
-## Strategy: Dual EMA Trend-Following
+## Strategy: Riley Coleman Price Action
 
-| Parameter            | Default | Description                        |
-|----------------------|---------|------------------------------------|
-| Fast EMA             | 20      | Short-term trend                   |
-| Slow EMA             | 55      | Long-term trend (Turtle default)   |
-| ATR Period           | 14      | Volatility measurement             |
-| ATR Stop Multiplier  | 2.0x    | Stop = entry ± (2 × ATR)          |
-| Risk Per Trade       | 1%      | Max account risk per position      |
+No indicators — pure price action on two timeframes:
 
-**Signal logic:**
-- BUY when EMA20 crosses above EMA55
-- SELL when EMA20 crosses below EMA55
-- Position size = (Account × 1%) / (ATR × Tick Value)
+| Timeframe | Purpose                                      |
+|-----------|----------------------------------------------|
+| 15-minute | Identify support & resistance zones          |
+| 1-minute  | Confirm entry (rejection candles, breakouts) |
+
+**Three setups:**
+
+**1. Retest Reversal** — Price breaks a key S/R level, pulls back to retest it, then shows a rejection candle. Enter in the direction of the original break. Stop goes just beyond the S/R zone (1.5x ATR). Target is set at 2x risk (minimum R:R = 2.0).
+
+**2. Failed Breakout** — Price briefly pierces through a level but closes back on the other side with a strong candle. Enter in the fade direction. Stop goes beyond the failed wick.
+
+**3. 7 AM Reversal** — The same retest setup, but detected between 9:30–10:00 AM ET (the NY open window). Tagged separately in logs because this window has the highest probability of sharp reversals.
+
+**S/R Level Detection:**
+- Scans the last 50 bars of the 15m chart for swing highs and lows
+- Clusters nearby pivots into zones
+- Requires at least 2 touches to qualify a level
+- Zone width scales with ATR (adapts to volatility)
+
+**Entry Confirmation:**
+- Rejection candle: lower wick ≥ 1.5x body for bullish, upper wick ≥ 1.5x body for bearish
+- Wick must be ≥ 40% of total bar range
+- Price must be within 1.5x ATR of the level
+
+**Risk Management:**
+- Minimum 2:1 R:R required — trades below this are skipped
+- Position size = (Account × 1%) / (ATR × 1.5 × Tick Value)
+- Profit target placed as a limit order automatically
+- Stop loss placed as a stop order automatically
 
 ---
 
